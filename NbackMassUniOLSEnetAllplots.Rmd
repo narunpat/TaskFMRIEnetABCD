@@ -1,0 +1,1909 @@
+---
+title: "Predicting cognitive performance from fMRI working memory data using the ABCD dataset"
+subtitle: "Mass-univariate, OLS regression, and elastic net"
+author: "Narun Pornpattananangkul, Adam Bartonicek and Yue Wang"
+date: "1/10/2020"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    number_sections: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+
+```{r}
+rm(list = ls(all.names = TRUE)) #will clear all objects includes hidden objects.
+gc() #free up memrory and report the memory usage.
+```
+
+# Data Preparation
+
+## Loading libraries
+
+The following libraries and default settings were used during the analysis:
+
+```{r load_libraries}
+options(scipen = 999)
+
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("survcomp")
+
+library(tidyverse)
+library(broom)
+library(eNetXplorer)
+library(glmnet)
+library(olsrr)
+library(caret)
+library(pander)
+library(tidymodels)
+library("cowplot")
+
+
+##parallel map
+
+#library(parallel)  
+library("furrr")
+future::plan(multiprocess(workers = 16))
+
+theme_set(theme_bw() + theme(panel.grid = element_blank()))
+
+```
+
+## Loading the data
+
+We first loaded all of the relevant data files (not shown here as they refer to local directories):
+
+```{r load_data, echo=FALSE}
+##qnap
+dataFold = "/mnt/data/ABCD/ABCD_LVM/Tables2p01/"
+manipuFold = "/mnt/data/ABCD/ABCD_LVM/Analysis/ManipulatedData/"
+anotherFold = "/mnt/data/Yue script/"
+```
+
+```{r}
+MRFINDINGS01 <-read.csv(paste0(dataFold, "ABCD_MRFINDINGS01_DATA_TABLE.csv")) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+MRIQCRP102 <-read.csv(paste0(dataFold, "MRIQCRP102_DATA_TABLE.csv")) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+MRIQCRP202 <-read.csv(paste0(dataFold, "MRIQCRP202_DATA_TABLE.csv")) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+MRIQCRP302 <-read.csv(paste0(dataFold, "MRIQCRP302_DATA_TABLE.csv")) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+FREESQC01 <-read.csv(paste0(dataFold, "FREESQC01_DATA_TABLE.csv")) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+DMRIQC01 <-read.csv(paste0(dataFold, "DMRIQC01_DATA_TABLE.csv")) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+NBackBeh <-read.csv(paste0(dataFold, "ABCD_MRINBACK02_DATA_TABLE.csv")) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+NBackAparc <-read.csv(paste0(dataFold, "NBACK_BWROI02_DATA_TABLE.csv")) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+NbackAsegDest <-read.csv(paste0(manipuFold, "NbackDestAsegReadableGgseg3d.csv")) 
+# NbackAsegDestR1 <-read.csv(paste0(manipuFold, "NbackDestAsegReadableGgseg3dRunOne.csv"))
+# NbackAsegDestR2 <-read.csv(paste0(manipuFold, "NbackDestAsegReadableGgseg3dRunTwo.csv")) 
+MRIinfo <-tbl_df(read.csv(paste0(dataFold, "ABCD_MRI01_DATA_TABLE.csv"))) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+Siteinfo <-tbl_df(read.csv(paste0(dataFold, "ABCD_LT01_DATA_TABLE.csv"))) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+NIH_TB <-tbl_df(read.csv(paste0(dataFold,"ABCD_TBSS01_DATA_TABLE.csv"))) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+LittleMan <-tbl_df(read.csv(paste0(dataFold,"LMTP201_DATA_TABLE.csv"))) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1") 
+Pearson <-tbl_df(read.csv(paste0(dataFold,"ABCD_PS01_DATA_TABLE.csv"))) %>% 
+  filter(EVENTNAME =="baseline_year_1_arm_1")
+
+short_names <- tbl_df(read.csv(paste0(anotherFold,"ShortNames_all.csv") ))
+
+MRIQcAll <- plyr::join_all(list(MRFINDINGS01,MRIQCRP102,
+                          MRIQCRP202,MRIQCRP302,FREESQC01,DMRIQC01,
+                          NBackBeh,NBackAparc,NbackAsegDest,MRIinfo,Siteinfo,NIH_TB,LittleMan,Pearson), 
+                          by='SUBJECTKEY', type='full')
+
+MRIQcAll <- MRIQcAll[,!duplicated(colnames(MRIQcAll))]
+
+```
+
+## Quality control (QC)
+
+Next, we included only the participants that passed the following QC:
+
+```{r quality_control}
+
+MRIQcAll$NoIncidental <- ifelse((MRIQcAll$MRIF_SCORE== 3 | 
+                                   MRIQcAll$MRIF_SCORE== 4 |
+                                   MRIQcAll$MRIF_HYDROCEPHALUS == "yes"|         
+                                   MRIQcAll$MRIF_HERNIATION == "yes"), 0, 1)
+count(MRIQcAll,NoIncidental)
+
+MRIQcAll %>% count(IQC_T1_OK_SER)
+
+MRIQcAll %>% count(FSQC_QC)
+
+MRIQcAll$T1FreeSurferQCOk <- ifelse((MRIQcAll$IQC_T1_OK_SER > 0 & 
+                                       MRIQcAll$FSQC_QC == 1), 1, 0)
+
+count(MRIQcAll,T1FreeSurferQCOk)
+
+MRIQcAll %>% count(IQC_NBACK_OK_SER>0)
+
+MRIQcAll %>% count(TFMRI_NBACK_BEH_PERFORMFLAG==1)
+
+MRIQcAll %>% count(TFMRI_NBACK_ALL_BETA_DOF>200)
+
+MRIQcAll$NbackBehDofOk <- ifelse((MRIQcAll$IQC_NBACK_OK_SER>0 &
+                                    MRIQcAll$TFMRI_NBACK_BEH_PERFORMFLAG ==1 &
+                                    MRIQcAll$TFMRI_NBACK_ALL_BETA_DOF>200), 1, 0)
+count(MRIQcAll,NbackBehDofOk)
+
+MRIQcAll$AllNbackQc <- ifelse((MRIQcAll$NoIncidental == 1 & 
+                                 MRIQcAll$T1FreeSurferQCOk == 1 & 
+                                 MRIQcAll$NbackBehDofOk == 1), 1, 0)
+count(MRIQcAll,AllNbackQc)
+
+Nback.QCed <- MRIQcAll %>% filter(AllNbackQc == 1)
+
+```
+
+
+## Remove Phillips
+
+There was an issue was reported with the Philips scanners and it was recommended that the data from these scanners should be dropped. We did so:
+
+```{r drop_phillips}
+Nback.QCed %>% count(MRI_INFO_MANUFACTURER)
+
+#remove phil and add beh during fMRI
+Nback.QCedNoPhil <- Nback.QCed %>%
+  filter(MRI_INFO_MANUFACTURER != 'Philips Medical Systems') 
+
+#check how many variables in X2backVS0back and the list of ROIs
+Nback.2backVS0back <- Nback.QCedNoPhil%>% select(.,starts_with("X2backvs0back"))
+#colnames(Nback.2backVS0back)
+```
+
+
+Here are a list of responsevariable names which are used in the later analysis. Both short names ang long names are used in plotting.
+
+```{r select_vars, data_pre1}
+
+Resp_Var <- c('TFMRI_NB_ALL_BEH_C2B_RATE',
+              "NIHTBX_PICVOCAB_UNCORRECTED", 
+              "NIHTBX_FLANKER_UNCORRECTED",
+              "NIHTBX_LIST_UNCORRECTED",
+              "NIHTBX_CARDSORT_UNCORRECTED",
+              "NIHTBX_PATTERN_UNCORRECTED",
+              "NIHTBX_PICTURE_UNCORRECTED",
+              "NIHTBX_READING_UNCORRECTED",
+              "LMT_SCR_PERC_CORRECT",
+              "PEA_RAVLT_LD_TRIAL_VII_TC",
+              "PEA_WISCV_TRS")
+resp_var_plotting_long <- c("2-back working memory",
+  "Picture vocabulary test",
+  "Flanker test",
+  "List sorting working memory",
+  "Dimentional change card sort test",
+  "Pattern comparison processing speed test",
+  "Picture sequence memory test",
+  "Oral reading recognition test",
+  "Little man task correct percentage",
+  "RAVLT long delay trial VII total correct",
+  "WISC_V matrix reasoning total raw score"
+)
+resp_var_plotting_short <- c("2-back Work Mem","Pic Vocab","Flanker","List Work Mem","Cog Flex","Pattern Speed","Seq Memory","Reading Recog","Little Man","Audi Verbal","Matrix Reason")
+resp_var_plotting <- tibble("response" = all_of(Resp_Var), "longer_name"=resp_var_plotting_long,"short_name"=resp_var_plotting_short)
+
+subj_info <- c('SUBJECTKEY', 'MRI_INFO_DEVICESERIALNUMBER', 'SITE_ID_L')
+
+data_all_average <- Nback.QCedNoPhil %>%
+  select(SUBJECTKEY, all_of(subj_info), all_of(Resp_Var),
+         starts_with('X2backvs0back')) %>%
+  rename_at(vars(-all_of(subj_info),-all_of(Resp_Var)),
+            ~ str_replace(., 'X2backvs0back_ROI_', 'roi_'))
+### checking whether the short names and ROI names in the data are the same
+name_check <- which(short_names$roi != str_remove(names(select(data_all_average,starts_with("roi_"))),"roi_"))
+print(name_check)
+
+new_shorter_names <- short_names 
+new_shorter_names$roiShort[97] <- "R Subcentral"
+new_shorter_names$roiShort <-  str_squish(string = new_shorter_names$roiShort)
+#new_shorter_names$roiShort <-  str_replace_all(string = new_shorter_names$roiShort, pattern = "\t", replacement = "")
+### change ROI names to shorter ones (does not compat with formulas so not used)
+#data_all_average <- data_all_average %>% rename_at(vars(starts_with("roi_")),~ new_shorter_names$roiShort)
+```
+
+## Selecting data
+
+We also performed listwise deletion and dropped all participants for whom either the behavioral performance or the activation across some brain area was greater than 3 * IQR (interquartile range).
+
+```{r data_pre2}
+
+data_all_listwise <- data_all_average %>%
+  drop_na() 
+
+IQR_remove <- function(data_split){
+  data_split%>%
+  mutate_at(vars(- all_of(subj_info)), ~ ifelse(
+    .x > quantile(.x, na.rm = TRUE)[4] + 3 * IQR(.x, na.rm = TRUE) |
+    .x < quantile(.x, na.rm = TRUE)[2] - 3 * IQR(.x, na.rm = TRUE), 
+    NA, .x)) %>%
+  drop_na() %>%
+  mutate_if(is.double, ~ (.x - mean(.x)) / sd(.x)) 
+}
+  
+
+n_all <- nrow(data_all_average)
+n_listwise <- nrow(data_all_listwise)
+n_diff_all_listwise <- nrow(data_all_average) - nrow(data_all_listwise)
+
+```
+
+The outliers are removed with respect to training and testing data set. So no count of columns is displayed here.
+
+## Check participant numbers across sites and scanners
+
+Next we checked the number of participants across sites and scanners:
+Note that site 22 and site08 have fewer than 100 participants whcn IQR rules were applied.
+
+```{r check_scanners_sites}
+
+nrow(data_all_listwise)
+
+#26 scanners but 8 have fewer than 100 participants (as low as 3)
+data_all_listwise  %>% count(MRI_INFO_DEVICESERIALNUMBER) %>% 
+  summarize(`Number of scanners`=n()) %>%
+  pander(split.cell = 80, split.table = Inf, justify = 'left')
+
+data_all_listwise  %>% 
+  count(MRI_INFO_DEVICESERIALNUMBER) %>%
+  arrange(n) %>% 
+  rename(`Scanner ID` = MRI_INFO_DEVICESERIALNUMBER, `Number of participants` = n) %>%
+  pander(split.cell = 80, split.table = Inf, justify = 'left')
+
+#19 sites, but 2 sites are fewer than 100 -> use sites?
+data_all_listwise  %>% 
+  count(SITE_ID_L) %>% 
+  summarize(`Number of sites`=n())  %>%
+  pander(split.cell = 80, split.table = Inf, justify = 'left')
+
+data_all_listwise  %>% 
+  count(SITE_ID_L) %>% 
+  arrange(n) %>% 
+  rename(`Site ID` = SITE_ID_L, `Number of participants` = n) %>%
+  pander(split.cell = 80, split.table = Inf, justify = 'left')
+
+# Remove site 22 and 8
+data_all_listwise <- data_all_listwise %>%
+  filter(SITE_ID_L != 'site22' & SITE_ID_L != 'site08')
+```
+
+## Check the distribution of all of the cognitive tasks
+Most are normally distributed.
+
+```{r plot_distribution_dvs}
+
+#Look at distribution of NIHTBX_LIST_UNCORRECTED (i.e., working memory from Nback)
+resp_names <-data_all_listwise %>% select(all_of(Resp_Var))%>%
+  names()%>%
+  set_names()
+
+density_plot_grid <- resp_names %>%
+  map(~ggplot(data_all_listwise,aes(x=.data[[.]])) 
+      +stat_function(fun=dnorm, 
+                color="skyblue", size = 1.5,
+                args=list(mean=mean(data_all_listwise$.),
+                          sd=sd(data_all_listwise$.))) +
+  geom_density() +
+  labs(x = NULL, y =NULL,title = resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]])
+)
+title_density_plot <- ggdraw() + 
+  draw_label(
+    "Density plots of all the Cognitive Performance Variables",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+plot_grid(title_density_plot,plot_grid(plotlist = density_plot_grid),nrow = 2 , rel_heights = c(0.1, 1))
+
+
+```
+
+```{r,echo=FALSE,eval=FALSE}
+saveRDS(data_all_listwise, '/mnt/data/Yue script/task_data.RData')
+```
+# Modeling preparation
+
+## Sample training and test data
+
+To create the training and test data, we randomly sampled 75% of participants and assigned them to the training set. The rest of the participants were assigned to hold-out test data. 
+
+```{r sample_train_test, eval=TRUE}
+set.seed(123456)
+data_vfold =vfold_cv(data = data_all_listwise, v=4,repeats = 1)
+```
+
+
+```{r, eval=FALSE,echo=FALSE}
+saveRDS(data_vfold, file = "/mnt/data/Yue script/task_fold.RData")
+```
+
+Split the data for the cross validation grouped by site. Use one site as holdout and the other sites for training
+
+```{r sample_hold_1_site }
+unique_site <- length(unique(data_all_listwise$SITE_ID_L))
+
+site_vfold <- group_vfold_cv(data = data_all_listwise, group = "SITE_ID_L", v= unique_site)
+## the following two lines take the split results and transform it into a data frame
+## so that all the results can be checked.
+#model_data_1 <- site_vfold$splits[[1]]%>% analysis()
+#holdout__data_1 <- site_vfold$splits[[1]] %>% assessment()
+```
+# Mass univariate modeling
+
+## Fit simple regressions on training data & evaluate on test data
+
+```{r fit_simple1, eval=TRUE}
+
+## splits will be the `rsplit` object with the 90/10 partition
+holdout_results <- function(.x,splits, ...) {
+  # Fit the model to the 75%
+  mod <- lm(..., data = analysis(splits)%>% IQR_remove())
+  # Save the 25%
+  holdout <- assessment(splits)%>% IQR_remove()
+  # `augment` will save the predictions with the holdout data set
+  res <- broom::augment(mod, newdata = holdout)
+  preds <- predict(mod, newdata = holdout)
+  performance <- cor(preds, holdout[[.x]])
+  
+  slope <- mod %>% broom::tidy() %>% 
+    filter(term != '(Intercept)') %>%
+    rename(roi = term)
+  slope_corr <- slope %>% bind_cols(performance = performance)
+  
+  slope_corr
+}
+
+resp_result <- function(.x){
+  x=.x
+  formulas <- paste0(x ,' ~ ', colnames(select(data_all_listwise,-all_of(Resp_Var),-all_of(subj_info))))
+  results_test_simple <-map(formulas, ~ holdout_results(.x=x,splits = data_vfold$splits[[1]],...)) %>% bind_rows() %>%
+  mutate(FDR = p.adjust(p.value, method = 'fdr'),
+          bonferroni= p.adjust(p.value, method = 'bonferroni'))
+  return(results_test_simple)
+}
+```
+
+
+```{r fit_simple_calculation, eval=FALSE}
+simple_all_IQR <- map(.x=resp_names,~resp_result(.x))
+```
+
+```{r, eval=FALSE, echo=FALSE}
+saveRDS(simple_all_IQR,file ="/mnt/data/Yue script/simple_reg_all_IQR.RData" )
+```
+
+
+```{r, echo=FALSE}
+simple_all_IQR <- readRDS(file ="/mnt/data/Yue script/simple_reg_all.RData" )
+```
+
+## Out-of-sample, out-of-scanner predictive ablitiy for the mass univariate
+
+```{r plotting_simple}
+
+longer_all <-resp_names %>% map(.,~pivot_longer(simple_all_IQR[[.]],cols = c("bonferroni","FDR", "p.value"),names_to="p_val_type",values_to="p_vals"))
+##To plot all the density of all the areas vurses significant areas after two corrections
+##I set all the uncorrected p value to 0 to pass the screening in the plotting function
+longer_all <-resp_names %>%map(.,~mutate(longer_all[[.]],plt_val = ifelse(p_val_type=="p.value",0,p_vals))) 
+longer_all <-resp_names %>%map(.,~mutate(longer_all[[.]],plt_type = ifelse(p_val_type=="p.value","All",ifelse(p_val_type=="FDR","FDR","Bonferroni")))) 
+
+sig_all <-  longer_all %>%map(.,~filter(.,plt_val < 0.05)%>%mutate(.,plt_type= as.factor(plt_type))%>%
+                                mutate(.,plt_type = factor(.$plt_type,levels =c ("All","FDR","Bonferroni"))))
+simple_plot_list <- resp_names %>%map(.,~ggplot(sig_all[[.]],aes(performance,color=plt_type, fill=plt_type)) +
+  geom_histogram(binwidth = 0.01, position = 'identity',alpha=0.5) +
+  scale_x_continuous(limits = c(-0.1, 0.25)) +
+  scale_y_continuous(limits = c(0, 30)) +
+  labs(x = NULL, fill = NULL, y = NULL,
+       title = resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]])+
+    #scale_color_manual(values = c("darkgoldenrod1","brown2","cyan3"))+
+     #scale_fill_manual(values = c("darkgoldenrod1","brown2","cyan3"))+
+    guides(color=FALSE)
+ )
+
+title_simple_plot <- ggdraw() + 
+  draw_label(
+    "Out-of-sample Mass-Univariate Predictive Ability (Pearson's r)",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+```
+
+### Out-of-sample, out-of-scanner predictive ablitiy across corrections for mass univariate
+
+```{r}
+ggpubr::ggarrange(title_simple_plot,ggpubr::ggarrange(plotlist=simple_plot_list, common.legend = TRUE),nrow = 2 , heights = c(0.1, 1))  
+
+ n_signif_fdr <- resp_names %>% map(.,~filter(simple_all_IQR[[.]],FDR < 0.05))  
+ n_signif_fdr <- resp_names %>% map(.,~count(n_signif_fdr[[.]]))%>%do.call(rbind,.) 
+ 
+ n_signif_bonf <- resp_names %>% map(.,~filter(simple_all_IQR[[.]], bonferroni< 0.05))  
+ n_signif_bonf <- resp_names %>% map(.,~count(n_signif_bonf[[.]]))%>%do.call(rbind,.) 
+ 
+ n_sig_all <- data.frame("var_name"=resp_var_plotting$short_name,"FDR_total"=n_signif_fdr$n,"BONF_total"=n_signif_bonf$n)%>% as_tibble()%>%print()
+
+```
+
+For the n-back behavioral performance, With FDR adjustment, there were `r as.numeric(n_signif_fdr[1,1])` significant ROIs out of the 167 total. With Bonferroni adjustment, there were `r as.numeric(n_signif_bonf[1,1])` significant ROIs.
+
+## Statistical Inferences for the mass univeriate 
+Plotting all significant areas for mass univariate with 2SE
+
+```{r fit_simple2, fig.height=9, fig.width=8}
+sig_all_wider_FDR <- resp_names %>% map(.,~filter(simple_all_IQR[[.]],FDR < 0.05))
+sig_all_wider_FDR_rename <- resp_names %>% map(.,~mutate(sig_all_wider_FDR[[.]],roi = str_remove(roi, 'roi_')))
+sig_all_wider_FDR_rename <- sig_all_wider_FDR_rename %>% map(.,~left_join( .,new_shorter_names,by="roi"))
+roi_num_simple_FDR <- sig_all_wider_FDR_rename %>% map(.,~dim(.)[1])
+max_roi_simple_FDR <- max(as.numeric(roi_num_simple_FDR))
+sig_all_wider_FDR_rename <- resp_names %>% map(.,~mutate(sig_all_wider_FDR_rename[[.]],direction = ifelse(sig_all_wider_FDR_rename[[.]]$estimate >= median(sig_all_wider_FDR_rename[[.]]$estimate)|roi_num_simple_FDR[[.]] <= floor(max_roi_simple_FDR/2),"big","small")))
+
+resp_names %>% map(~ggplot(sig_all_wider_FDR_rename[[.]],aes(x = fct_reorder(roiShort, estimate), y = estimate,
+             ymin = estimate - 2 * std.error, ymax = estimate + 2 * std.error)) +
+  geom_hline(yintercept = 0, linetype = 'dashed', col = 'grey60') +
+  geom_pointrange(fatten = 1.5, col = 'grey60') +
+  coord_flip() +
+guides(colour = guide_legend(override.aes = list(size = 2.5)))+
+  labs(x = 'Brain Regoins that passed FDR', y=NULL,
+       title =paste0("Mass-Univariate Parameter Estimates (Training Set)\n",resp_var_plotting$longer_name[[which(resp_var_plotting$response==.)]]) ) +
+  facet_wrap(~direction, scales = "free_y" ) +     
+theme_bw() +  
+#theme(axis.text.y = element_text(angle = 15)) +
+theme(legend.title=element_blank()) +  
+theme(legend.position = "top") + 
+theme(
+  axis.title.x = element_text(size = 20),
+  axis.text.x = element_text(size = 10),
+  axis.title.y = element_text(size = 10),
+  axis.text.y = element_text(size = 10),
+  legend.text = element_text(size = 10)) +
+ theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+                     )
+)
+## print the summary statistics for rois passed FDR correction
+## maximum
+ max_FDR <-resp_names %>% map(., ~sig_all_wider_FDR_rename[[.]][which(sig_all_wider_FDR_rename[[.]]$performance==max(sig_all_wider_FDR_rename[[.]]$performance)),]%>% select(.,-roi,-direction)) %>% do.call(rbind,.)%>%select("estimate", "performance","FDR","bonferroni","roiShort")%>%print()
+##minimum
+min_FDR <-resp_names %>% map(., ~sig_all_wider_FDR_rename[[.]][which(sig_all_wider_FDR_rename[[.]]$performance==min(sig_all_wider_FDR_rename[[.]]$performance)),]%>% select(.,-roi,-direction)) %>% do.call(rbind,.)%>%select("estimate", "performance","FDR","bonferroni","roiShort")%>%print()
+##median
+median_FDR <-resp_names %>% map(., ~sig_all_wider_FDR_rename[[.]][which(sig_all_wider_FDR_rename[[.]]$performance==median(sig_all_wider_FDR_rename[[.]]$performance)),]%>% select(.,-roi,-direction)) %>% do.call(rbind,.)%>%select("estimate", "performance","FDR","bonferroni","roiShort")%>%print()
+## print the mean parameter estimation and performance that passed FDR corredtion
+FDR_mean_est <- resp_names %>% map(.,~mean(sig_all_wider_FDR_rename[[.]]$estimate))%>%do.call(rbind,.)
+FDR_mean_perform <- resp_names %>% map(.,~mean(sig_all_wider_FDR_rename[[.]]$performance))%>%do.call(rbind,.)
+FDR_sd_est <- resp_names %>% map(.,~sd(sig_all_wider_FDR_rename[[.]]$estimate))%>%do.call(rbind,.)
+FDR_sd_perform <- resp_names %>% map(.,~sd(sig_all_wider_FDR_rename[[.]]$performance))%>%do.call(rbind,.)
+FDR_print <- data.frame("var_name_FDR"=resp_var_plotting$short_name,"Mean_estimation"=FDR_mean_est,"SD_Estimation"=FDR_sd_est,"Mean_Performance"=FDR_mean_perform,"SD_performance"=FDR_sd_perform)%>% as_tibble()%>%print()
+
+sig_all_wider_bonf <- resp_names %>% map(.,~filter(simple_all_IQR[[.]],bonferroni < 0.05))
+sig_all_wider_bonf_rename <- resp_names %>% map(.,~mutate(sig_all_wider_bonf[[.]],roi = str_remove(roi, 'roi_')))
+sig_all_wider_bonf_rename <- sig_all_wider_bonf_rename %>% map(.,~left_join( .,new_shorter_names,by="roi"))
+roi_num_simple_bonf <- sig_all_wider_bonf_rename %>% map(.,~dim(.)[1])
+max_roi_simple_bonf <- max(as.numeric(roi_num_simple_bonf))
+sig_all_wider_bonf_rename <- resp_names %>% map(.,~mutate(sig_all_wider_bonf_rename[[.]],direction = ifelse(sig_all_wider_bonf_rename[[.]]$estimate >= median(sig_all_wider_bonf_rename[[.]]$estimate)|roi_num_simple_bonf[[.]] <= floor(max_roi_simple_bonf/2),"big","small")))
+ 
+resp_names %>% map(~ggplot(sig_all_wider_bonf_rename[[.]],aes(x = fct_reorder(roiShort, estimate), y = estimate,
+             ymin = estimate - 2 * std.error, ymax = estimate + 2 * std.error)) +
+  geom_hline(yintercept = 0, linetype = 'dashed', col = 'grey60') +
+  geom_pointrange(fatten = 1.5, col = 'grey60') +
+  coord_flip() +
+guides(colour = guide_legend(override.aes = list(size = 2.5)))+
+  labs(x = 'Brain Regions that passed Bonferroni', y=NULL,
+       title = paste0("Mass-Univariate Parameter Estimates (Training Set)\n",resp_var_plotting$longer_name[[which(resp_var_plotting$response==.)]]) ) +
+  facet_wrap(~direction, scales = "free_y" ) +     
+theme_bw() +  
+#theme(axis.text.y = element_text(angle = 15)) +
+theme(legend.title=element_blank()) +  
+theme(legend.position = "top") + 
+theme(
+  axis.title.x = element_text(size = 20),
+  axis.text.x = element_text(size = 10),
+  axis.title.y = element_text(size = 10),
+  axis.text.y = element_text(size = 10),
+  legend.text = element_text(size = 10)) +
+ theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+                     )
+)
+```
+
+## Summary statistics for out-of-sample predicitve ability for the Mass Univariate
+print the summary statistics for rois passed Bonf correction:   
+  
+### Maximum  
+```{r}
+ max_bonf <-resp_names %>% map(., ~sig_all_wider_bonf_rename[[.]][which(sig_all_wider_bonf_rename[[.]]$performance==max(sig_all_wider_bonf_rename[[.]]$performance)),]%>% select(.,-roi,-direction)) %>% do.call(rbind,.)%>%select("estimate", "performance","FDR","bonferroni","roiShort")%>%print()
+```
+  
+### Minimum  
+```{r}
+min_bonf <-resp_names %>% map(., ~sig_all_wider_bonf_rename[[.]][which(sig_all_wider_bonf_rename[[.]]$performance==min(sig_all_wider_bonf_rename[[.]]$performance)),]%>% select(.,-roi,-direction)) %>% do.call(rbind,.)%>%select("estimate", "performance","FDR","bonferroni","roiShort")%>%print()
+```
+  
+### Median  
+```{r}
+median_bonf <-resp_names %>% map(., ~sig_all_wider_bonf_rename[[.]][which(sig_all_wider_bonf_rename[[.]]$performance==median(sig_all_wider_bonf_rename[[.]]$performance)),]%>% select(.,-roi,-direction)) %>% do.call(rbind,.)%>%select("estimate", "performance","FDR","bonferroni","roiShort")%>%print()
+```
+
+### Mean parameter estimation and performance that passed Bonferroni
+
+```{r}
+bonf_mean_est <- resp_names %>% map(.,~mean(sig_all_wider_bonf_rename[[.]]$estimate))%>%do.call(rbind,.)
+bonf_mean_perform <- resp_names %>% map(.,~mean(sig_all_wider_bonf_rename[[.]]$performance))%>%do.call(rbind,.)
+bonf_sd_est <- resp_names %>% map(.,~sd(sig_all_wider_bonf_rename[[.]]$estimate))%>%do.call(rbind,.)
+bonf_sd_perform <- resp_names %>% map(.,~sd(sig_all_wider_bonf_rename[[.]]$performance))%>%do.call(rbind,.)
+bonf_print <- data.frame("var_name_bonf"=resp_var_plotting$short_name,"Mean_estimation"=bonf_mean_est,"SD_Estimation"=bonf_sd_est,"Mean_Performance"=bonf_mean_perform,"SD_performance"=bonf_sd_perform)%>% as_tibble()%>%print()
+
+```
+
+## Training coefficients vs. predictive ablitiy for the mass univariate
+
+```{r fit_simple3, fig.width=6, fig.height=6}
+slope_plot_grid <-resp_names %>% map(.,~ggplot(simple_all_IQR[[.]],aes(estimate, performance)) +
+  geom_point(col = 'grey60') +
+  labs(x = NULL, y = NULL,
+         title =resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]] )
+                     )
+
+title_slope_plot <- ggdraw() + 
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+slope_plot_figure<- plot_grid(title_slope_plot,plot_grid(plotlist = slope_plot_grid, nrow=4, ncol=3),nrow = 2 , rel_heights = c(0.1, 1))
+
+ggpubr::annotate_figure(slope_plot_figure,left= ggpubr::text_grob("Mass-Univariate Predictive Ability (Pearson's r)",size=15,rot=90),
+                        bottom = ggpubr::text_grob("Mass-Univariate Training Coefficients",size=15))
+```
+
+## Cross-validate mass univaraite across sites
+Set up folds & summary functions for cross-validation across sites
+
+```{r simple_reg6 }
+all_sample <- site_vfold$id
+
+all_site <-  all_sample %>% map (.,~unique(assessment(site_vfold$splits[[which(site_vfold$id==.)]])$SITE_ID_L)) %>% do.call(rbind,.)
+all_site <- as.vector(all_site)
+all_site_number <- str_remove_all(all_site,"site")
+
+site_result <- function(site_var,resp_var){
+  data_split <- site_vfold$splits[[which(site_vfold$id==site_var)]]
+  formula_site <- paste0(resp_var ,' ~ ', colnames(select(data_all_listwise,-all_of(Resp_Var),-all_of(subj_info))))
+  results_test_simple <-map(formula_site,~holdout_results(.x=resp_var,splits = data_split,...)) %>% bind_rows()%>%
+    mutate(site=unique(assessment(data_split)$SITE_ID_L))
+  return(results_test_simple)
+}
+
+```
+
+```{r fit_simple_cross_site, eval=FALSE}
+leave_one_all_IQR <- vector("list", length = length(resp_names))
+names(leave_one_all_IQR)<- resp_names
+#this command runs 10*17*167 simple regressions
+#pretty time-consuming. So not recommended to run
+for(i in 1:length(resp_names)){
+  leave_one_all_IQR[[resp_names[i]]]<- all_sample %>% map(.,~site_result(.,resp_var=resp_names[i]))%>%bind_rows() %>%
+  mutate(FDR = p.adjust(p.value, method = 'fdr'),
+          bonferroni= p.adjust(p.value, method = 'bonferroni'))
+}
+```
+
+```{r, eval=FALSE,echo=FALSE}
+saveRDS(leave_one_all_IQR, file = "/mnt/data/Yue script/simple_leave_one_site_all_IQR.RData")
+```
+
+```{r,echo=FALSE}
+simple_leave_one_all_IQR <- readRDS(file = "/mnt/data/Yue script/simple_leave_one_site_all_IQR.RData")
+```
+
+## Leave one site out cross validation results.
+
+```{r plotting_leave_one_site_simple}
+simple_leave_one_all_IQR <- resp_names %>% map(., ~mutate(simple_leave_one_all_IQR[[.]],site=str_remove(simple_leave_one_all_IQR[[.]]$site,"site")))
+
+simple_site_plot_grid <- resp_names %>% map(.,~ggplot(simple_leave_one_all_IQR[[.]],aes(x = site, y = performance)) +
+  geom_jitter(width = 0.1, height = 0, size = 0.5, col = 'grey40') +
+  geom_boxplot(alpha = 0.5, fill = 'grey80', col = 'grey40', outlier.colour = NA) +
+  scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+  labs(x = NULL, y = NULL,
+       title =resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]] )
+)
+title_simple_site <- ggdraw() + 
+  draw_label(
+   "Leave-One-Site-Out Mass-Univariate Predictive Ability",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+simple_site_plot_figure<- plot_grid(title_simple_site,plot_grid(plotlist = simple_site_plot_grid),nrow = 2 , rel_heights = c(0.1, 1))
+
+ggpubr::annotate_figure(simple_site_plot_figure,left= ggpubr::text_grob("Predictive Ability (Pearson's r)",size=15,rot=90),
+                        bottom = ggpubr::text_grob("Sites",size=15))
+
+## select the important areas for cross method plot
+simple_leave_one_all_FDR_IQR <- simple_leave_one_all_IQR %>% map(.,~filter(.,FDR<=0.05)%>% group_by(.,site)%>%nest(.,data=-site))
+simple_leave_one_all_bonf_IQR <- simple_leave_one_all_IQR %>% map(.,~filter(.,bonferroni<=0.05)%>% group_by(.,site)%>%nest(.,data=-site))
+cross_site_median = function(resp_var,data_input,method){
+    median_extract <- all_site_number %>% map(.,~median(data_input[[resp_var]]$data[[which(data_input[[resp_var]]$site==.)]]$performance))
+  combined_results <- tibble(performance = as.numeric(median_extract),site=simple_leave_one_all_FDR_IQR$TFMRI_NB_ALL_BEH_C2B_RATE$site,
+                              method=method,response=resp_var)
+  combined_results$site <- paste0("site", combined_results$site)
+  return(combined_results)
+}
+
+simple_leave_one_all_FDR_median_IQR<- resp_names %>% map (.,~cross_site_median(.,data_input=simple_leave_one_all_FDR_IQR,method = "FDR"))%>% bind_rows()%>%
+                                        left_join(.,resp_var_plotting,by="response")
+simple_leave_one_all_bonf_median_IQR<- resp_names %>% map (.,~cross_site_median(.,data_input=simple_leave_one_all_bonf_IQR,method = "Bonferroni"))%>% bind_rows()%>%left_join(.,resp_var_plotting,by="response")
+
+```
+
+## Leave-one-site-out predictive ablity for each roi for FDR and bonferroni
+
+```{r fit_simple5, fig.height=9, fig.width=8}
+rois_fdr <- simple_all_IQR %>%map(.,~filter(., FDR < 0.05) ) 
+rois_fdr <- rois_fdr %>% map(.,~pluck(.,'roi')) 
+
+rois_bonf <- simple_all_IQR %>%map(.,~filter(., bonferroni < 0.05) ) 
+rois_bonf <- rois_bonf %>% map(.,~pluck(.,'roi')) 
+nest_all <-  resp_names %>%map(., ~group_by(simple_leave_one_all_IQR[[.]],roi)) 
+nest_all <-  resp_names %>%map(., ~nest(simple_leave_one_all_IQR[[.]],data=-roi))
+roi_names <- nest_all[[resp_names[1]]]$roi
+nest_all_list <- nest_all %>% map(., ~as.list(.))
+nest_all_list <- nest_all_list%>% map (., ~.[["data"]])
+for(i in 1:length(resp_names)){
+  names(nest_all_list[[resp_names[i]]]) <- roi_names
+}
+nest_list_fdr <- resp_names %>% map(., ~nest_all_list[[.]][rois_fdr[[.]]]) 
+nest_list_fdr <- resp_names %>% map(.,~bind_rows(nest_list_fdr[[.]],.id = "roi"))
+nest_list_fdr <- nest_list_fdr %>% map(.,~mutate(., roi=str_remove(roi, "roi_"))%>%
+                                         left_join( .,new_shorter_names,by="roi"))
+roi_num_nest_list <- resp_names %>% map(.,~length(unique(nest_list_fdr[[.]]$roi)))
+max_roi_nest_FDR <- max(as.numeric(roi_num_nest_list))
+nest_list_fdr <- resp_names %>% map(.,~mutate(nest_list_fdr[[.]],direction = ifelse(nest_list_fdr[[.]]$estimate >= median(nest_list_fdr[[.]]$estimate)|roi_num_nest_list[[.]] <= floor(max_roi_nest_FDR/2),"big","small")))
+
+resp_names %>% map(.,~ggplot(nest_list_fdr[[.]],aes(x = roiShort, y = performance)) +
+  geom_jitter(width = 0.1, height = 0, size = 0.5) +
+  geom_boxplot(alpha = 0.5, fill = 'grey80', col = 'grey40', outlier.colour = NA) +
+  labs(x = "Regions significant after FDR correction", y = "Predictive Ability across sites (Pearson's r)",
+       title =paste0("Out-Of-Site Mass-Univariate Predictive Ability\n" , resp_var_plotting$longer_name[[which(resp_var_plotting$response==.)]] )) +
+  coord_flip()+  
+    facet_wrap(~direction, scales = "free_y" ) +
+    guides(colour = guide_legend(override.aes = list(size = 2.5)))+theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank())+ 
+   theme(axis.title.y = element_text(size = 16),
+         axis.title.x = element_text(size = 16),
+         plot.title = element_text(size=16))
+) 
+
+nest_list_bonf <- resp_names %>% map(., ~nest_all_list[[.]][rois_bonf[[.]]]) 
+nest_list_bonf <- resp_names %>% map(.,~bind_rows(nest_list_bonf[[.]],.id = "roi"))
+nest_list_bonf <- nest_list_bonf %>% map(.,~mutate(., roi=str_remove(roi, "roi_"))%>%
+                                         left_join( .,new_shorter_names,by="roi"))
+roi_num_nest_list_bonf <- resp_names %>% map(.,~length(unique(nest_list_bonf[[.]]$roi)))
+max_roi_nest_bonf <- max(as.numeric(roi_num_nest_list_bonf))
+nest_list_bonf <- resp_names %>% map(.,~mutate(nest_list_bonf[[.]],direction = ifelse(nest_list_bonf[[.]]$estimate >= median(nest_list_bonf[[.]]$estimate)|roi_num_nest_list_bonf[[.]] <= floor(max_roi_nest_bonf/2),"big","small")))
+resp_names %>% map(.,~ggplot(nest_list_bonf[[.]],aes(x = roiShort, y = performance)) +
+  geom_jitter(width = 0.1, height = 0, size = 0.5) +
+  geom_boxplot(alpha = 0.5, fill = 'grey80', col = 'grey40', outlier.colour = NA) +
+  labs(x = "ROI significant after Bonferroni correction", y = "Predictive Ability across sites (Pearson's r)",
+       title = paste0("Out-Of-Site Mass-Univariate Predictive Ability\n" , resp_var_plotting$longer_name[[which(resp_var_plotting$response==.)]] )) +
+  coord_flip()+  
+    facet_wrap(~direction, scales = "free_y" ) +
+    guides(colour = guide_legend(override.aes = list(size = 2.5)))+theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank())+ 
+   theme(axis.title.y = element_text(size = 16),
+         axis.title.x = element_text(size = 16),
+         plot.title = element_text(size=16))
+) 
+
+```
+
+# OLS regression
+
+## OLS out-of-sample predictive ability across tasks
+
+```{r fit_ols1}
+ols_var_all_train_IQR <- resp_names %>% map(.,~select(analysis(data_vfold$splits[[1]])%>% IQR_remove(),.,starts_with("roi")))
+ols_var_all_test_IQR <- resp_names %>% map(.,~select(assessment(data_vfold$splits[[1]])%>% IQR_remove(),.,starts_with("roi")))
+fit_ols_all <- map(.x = resp_names, ~lm(paste0(.x, "~ ."), data = ols_var_all_train_IQR[[.x]]))
+
+rsq_fit <- fit_ols_all %>%  map(.,~summary(.)$adj.r.squared)%>% do.call(rbind,.)
+ tibble(response=names(fit_ols_all),rsquared = rsq_fit[,1])%>% left_join(.,resp_var_plotting ,by="response")%>% 
+  select("longer_name","rsquared")%>%
+  pander(split.cell = 80, split.table = Inf, justify = 'left')
+
+preds_ols_all <- resp_names %>% map(.,~predict(fit_ols_all[[.]], newdata = ols_var_all_test_IQR[[.x]])) 
+
+predvsreal_ols_all  <- resp_names %>% map(., ~ tibble(predicted = preds_ols_all[[.]], observed=select(assessment(data_vfold$splits[[1]])%>% IQR_remove(),.))) 
+
+cor_ols_all <- resp_names %>% map(.,~cor(preds_ols_all[[.]], ols_var_all_test_IQR[[.]][[.]])) 
+rmse_ols_all <- resp_names %>% map(.,~sqrt(mean((preds_ols_all[[.]] - ols_var_all_test_IQR[[.]][[.]]) ^ 2))) 
+
+ols_pred_all <- resp_names %>% map(., ~ggplot(predvsreal_ols_all[[.]], aes(x = scale(predicted) , y = scale(observed[[.]]))) +
+  geom_jitter(height = 0.1, width = 0.1, size = 1, col = 'grey60') +
+  geom_smooth(method = 'lm', se = FALSE, col = 'black')  +
+  labs(x = NULL,
+       y = NULL,
+       title = paste (resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]],'\nr = ',round(cor_ols_all[[.]], 3))) 
+                     )
+  title_ols_pred_plot <- ggdraw() + 
+  draw_label(
+    "Out-of-Sample OLS Predictive Ability",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+  ols_pred_all_figure<- plot_grid(title_ols_pred_plot,plot_grid(plotlist = ols_pred_all),nrow = 2 , rel_heights = c(0.1, 1))
+
+  ggpubr::annotate_figure(ols_pred_all_figure,left= ggpubr::text_grob("Observed Cognitive Performance (Z)",size=15,rot=90),
+                        bottom = ggpubr::text_grob("Predicted Cognitive Performance (Z)",size=15))
+```
+  
+## OLS out-of-sample predictive ability for the n-back only
+
+```{r,fig.width=8,fig.height=6}  
+
+ggplot(predvsreal_ols_all[[resp_names[1]]], aes(x = scale(predicted) , y = scale(observed) )) +
+  geom_jitter(height = 0.1, width = 0.1, size = 1, col = 'grey60') +
+  geom_smooth(method = 'lm', se = FALSE, col = 'black') +
+  labs(x =paste0("Predicted ",  resp_var_plotting$short_name[[which(resp_var_plotting$response==resp_names[1])]] ," (Z)")  ,
+       y = paste0("Observed\n",  resp_var_plotting$short_name[[which(resp_var_plotting$response==resp_names[1])]] ," (Z)"),
+       title = paste ("Out-of-Sample OLS\nPredictive Ability ",'r = ',round(cor_ols_all[[resp_names[1]]], 2)))+
+       theme(axis.text=element_text(size=28),
+        axis.title=element_text(size=28),
+        plot.title = element_text(size=32))
+```
+
+## OLS statistical Inference
+
+```{r fit_ols2}
+tidy_fit_ols_all <-fit_ols_all %>%  map(., ~broom::tidy(.))
+tidy_fit_ols_all <- tidy_fit_ols_all %>%   map(.,~filter(.,term != '(Intercept)' & p.value < 0.05 )%>%
+                                             mutate(.,roi = str_remove(term, 'roi_'))%>%
+                                         left_join( .,new_shorter_names,by="roi")%>%
+                                         mutate(.,direction = ifelse(estimate >= median(estimate), "big","small")))
+
+resp_names %>% map(~ggplot(tidy_fit_ols_all[[.]],aes(fct_reorder(roiShort, estimate), estimate, 
+             ymin = estimate - 2 * std.error, 
+             ymax = estimate + 2 * std.error)) +
+  geom_hline(yintercept = 0, linetype = 'dashed', col = 'grey60') +
+  geom_pointrange(fatten = 1.5, col = 'grey60') +
+  coord_flip() +
+  labs(x = 'Explanatory variables (Brain Regions)', y = 'Coefficients (± 2 std. errors)',
+       title = paste0(resp_var_plotting$longer_name[[which(resp_var_plotting$response==.)]],
+       '\nOLS Coeffcients (p < .05)')) + 
+     facet_wrap(~ direction, scales = 'free_y') +
+                     theme(
+                       axis.title.x = element_text(size = 15),
+                       axis.text.x = element_text(size = 12),
+                       axis.title.y = element_text(size = 15),
+                       axis.text.y = element_text(size = 12),
+                       legend.text = element_text(size = 10),
+                       plot.title = element_text(size=16)) + 
+     theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+))
+
+
+n_sig_ols <- tidy_fit_ols_all %>% map(.,~filter(., p.value< 0.05) ) 
+n_sig_ols %>%map(.,~count(.))%>%do.call(rbind,.)%>% print()
+```
+
+## cross site functions for OLS
+
+```{r fit_ols3, warning=FALSE}
+ols_site <- function(resp_var,data_split = data_vfold$splits[[1]]){
+     #recipe train and test data are from ols as the variables are the same
+  data_train <- analysis(data_split)%>%IQR_remove()
+  data_test <- assessment(data_split)%>%IQR_remove()
+  ols_data_train <- select(data_train, resp_var, starts_with("roi"))
+  ols_data_test <- select(data_test,resp_var,starts_with("roi"))
+norm_recipe <- recipe(as.formula(paste0(resp_var, "~ .")) , data = ols_data_train) %>%
+  step_dummy(all_nominal()) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())  %>% 
+  # estimate the means and standard deviations
+  prep(training = ols_data_train, retain = TRUE)
+## model
+ols_mod <- linear_reg(penalty = tune() ,mixture =tune()) %>% 
+  set_engine("lm") 
+fit_ols <- ols_mod %>% fit(as.formula(paste0(resp_var, "~ .")),data= ols_data_train)
+pred_fit <-predict.model_fit(fit_ols,new_data = ols_data_test)
+corval <- cor(pred_fit$.pred, ols_data_test[[resp_var]])
+
+site_output <- tibble(performance = corval, site =unique(data_test$SITE_ID_L))
+
+site_output
+}
+
+ols_site_all <- function(resp_var){
+site_ols_all <- all_sample %>% future_map(.,~ols_site(all_of(resp_var), data_split=site_vfold$splits[[which(site_vfold$id==.)]]))
+site_ols_all<- bind_rows(site_ols_all)
+site_ols_all <- site_ols_all %>% mutate(response=resp_var,method="OLS")
+return(site_ols_all)
+}
+
+
+ols_cross_site <- vector("list", length = length(resp_names))
+names(ols_cross_site)<- resp_names
+ for(i in 1:length(resp_names)){
+   ols_cross_site[[i]] <- ols_site_all(resp_names[i])
+ }
+
+ols_cross_site_list <- ols_cross_site
+
+ols_cross_site <-  bind_rows(ols_cross_site)
+ols_cross_site <- left_join (ols_cross_site,resp_var_plotting, by="response")
+ols_site <- ols_cross_site %>%
+ggplot(aes(x = reorder(short_name,performance), y = performance)) +
+  geom_jitter(width = 0.1, height = 0, size = 0.5) +
+  geom_boxplot(alpha = 0.5, fill = 'grey80', col = 'grey40', outlier.colour = NA) +
+  labs(x=NULL,y=NULL,title="OLS") +
+  coord_flip()
+
+ols_site
+```
+
+# Elastic net  
+Elastic net is based on tidymodels. Once tuned eNetXplorer is used for stats inference
+
+```{r tidy_models1_enet, eval=TRUE}
+
+enet_tuning <- function(resp_var,data_split = data_vfold$splits[[1]]){
+     #recipe train and test data are from ols as the variables are the same
+  data_train <- analysis(data_split)%>% IQR_remove()
+  data_test <- assessment(data_split)%>% IQR_remove()
+  ols_data_train <- select(data_train, resp_var, starts_with("roi"))
+  ols_data_test <- select(data_test,resp_var,starts_with("roi"))
+norm_recipe <- recipe(as.formula(paste0(resp_var, "~ .")) , data = ols_data_train) %>%
+  step_dummy(all_nominal()) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())  %>% 
+  # estimate the means and standard deviations
+  prep(training = ols_data_train, retain = TRUE)
+## model
+glmn_mod <- linear_reg(penalty = tune() ,mixture =tune()) %>% 
+  set_engine("glmnet") 
+set.seed(123456)
+all_rs <- rsample::vfold_cv(data=ols_data_train,v = 10,repeats = 1)#10fold split within the original 75% training data
+glmn_wfl <- workflow()%>%
+  add_recipe(norm_recipe)%>%
+  add_model(glmn_mod)
+##penalty is lambda, mixture is alpha
+##log transformed to get lambda between 0.025 to 10
+glmn_set <- dials::parameters(penalty(range = c(-5,1), trans = log10_trans()),mixture())
+## 100 levels of lambda and 10 levels of alpha
+glmn_grid <- grid_regular(glmn_set, levels = c(400,100))
+ctrl <- control_grid(save_pred = TRUE, verbose = TRUE)
+
+glmn_tune <- tune_grid(glmn_wfl,
+            resamples = all_rs,
+            grid = glmn_grid,
+            metrics = metric_set(rsq_trad),##use traditional r square because there is no correlation
+            control = ctrl)
+##select the best tuned lambda and alpha
+best_glmn <- select_best(glmn_tune, metric = "rsq_trad")
+## use the best tunes parameters to fit the test data
+glmn_wfl_final <- 
+  glmn_wfl %>%
+  finalize_workflow(best_glmn) %>%
+  fit(data = ols_data_train)
+pred_glmn <- predict(glmn_wfl_final, new_data =ols_data_test)
+##compute the correlation between predicted results and the test data 
+performance_glmn <- cor(pred_glmn$.pred,ols_data_test[[resp_var]])
+best_glmn <- best_glmn %>% mutate(performance=performance_glmn)
+return(best_glmn)
+}
+```
+
+```{r fit_enet_tuning, eval=FALSE}
+#this line tuning all the parameters in all 11 response variables
+# time consuming so the default of this section is set to eval= FALSE
+glmn_tune_all_IQR <- resp_names%>% future_map(.,~enet_tuning(.))
+```
+
+```{r,eval=FALSE,echo=FALSE}
+saveRDS(glmn_tune_all_IQR,file ="/mnt/data/Yue script/glmn_tune_all_IQR.RData" )
+```
+
+```{r get_tuned_parameters,echo=FALSE}
+glmn_tuning_all_IQR <- readRDS(file ="/mnt/data/Yue script/glmn_tune_all_IQR.RData")
+```
+
+
+```{r fit_enet_data}
+enet_test <- select(assessment(data_vfold$splits[[1]])%>%IQR_remove() ,starts_with("roi"))
+enet_train <- select(analysis(data_vfold$splits[[1]])%>%IQR_remove(),starts_with("roi"))
+enet_resp_train <- resp_names %>% map(., ~select(analysis(data_vfold$splits[[1]])%>%IQR_remove(),starts_with(.)))
+enet_resp_test <- resp_names %>% map(., ~select(assessment(data_vfold$splits[[1]])%>%IQR_remove(),starts_with(.)))
+```
+
+```{r fit_enet1, eval=FALSE}
+### NOT RUN by default, takes long time
+
+fit_enet_all_IQR <-resp_names %>% future_map(.,~eNetXplorer(x = as.matrix(enet_train) , y = as.vector(enet_resp_train[[.]][[.]]), alpha = glmn_tuning_all_IQR[[.]]$mixture, n_fold = 10,nlambda.ext = 1000, nlambda = 1000, scaled = TRUE, seed = 123456)) 
+```
+
+```{r,eval=FALSE,echo=FALSE}
+saveRDS(fit_enet_all_IQR, '/mnt/data/Yue script/fit_ridge_all_IQR.RData')
+```
+
+```{r,echo=FALSE}
+fit_enet_all_IQR  <- read_rds('/mnt/data/Yue script/fit_ridge_all_IQR.RData')
+```
+
+## Hyperparameter tuning for elastic net
+
+```{r fit_enet2}
+lambdas_all <- vector("list", length = length(resp_names))
+names(lambdas_all)<- resp_names
+lambdas_all_best <- vector("list", length = length(resp_names))
+names(lambdas_all_best)<- resp_names
+summary_enet_all <- vector("list", length = length(resp_names))
+names(summary_enet_all)<- resp_names
+
+for(i in 1:length(resp_names)){
+  lambdas_all[[resp_names[i]]] <- fit_enet_all_IQR[[resp_names[i]]][["lambda_values"]]
+lambdas_all_best[[resp_names[i]]] <- fit_enet_all_IQR[[resp_names[i]]][["best_lambda"]]
+summary_enet_all[[resp_names[i]]]<- as_tibble(summary(fit_enet_all_IQR[[resp_names[i]]])[[2]]) %>% slice(1)
+}
+
+summary_enet_all %>% bind_rows() %>% 
+  mutate(respones = resp_var_plotting$short_name)%>%
+  rename(.,Alpha = alpha, `Best-tune lambda` = lambda.max, 
+         `Accuracy (Pearson r)` = QF.est, 
+         `P-value` = model.vs.null.pval) %>%
+  pander(split.cell = 80, split.table = Inf, justify = 'left')
+
+alpha_vals <- glmn_tuning_all_IQR %>% map(.,~paste0("a",.[["mixture"]])) 
+
+enet_lambda_grid <-resp_names%>% map(.,~qplot(fit_enet_all_IQR[[.]][["lambda_values"]][[alpha_vals[[.]]]], fit_enet_all_IQR[[.]][["lambda_QF_est"]][[alpha_vals[[.]]]], geom = 'line') + 
+#  scale_y_continuous(breaks = seq(0, 0.6, by = 0.1)) +
+  scale_x_log10() +
+  geom_vline(xintercept = lambdas_all_best[[.]], col = 'red', linetype = 'dashed') +
+  labs(x = NULL, y = NULL, title =resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]] )
+  #+theme(axis.title.y=element_blank(),
+   #     axis.text.y=element_blank(),
+    #    axis.ticks.y=element_blank())
+  )  
+title_enet_lambda <- ggdraw() + 
+  draw_label(
+    "Elastic Net Lambda (Penalty) Parameter Tuning",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0.1, 0.1, 0.1, 7)
+  )
+
+enet_lambda_all_figure<- plot_grid(title_enet_lambda,plot_grid(plotlist = enet_lambda_grid,nrow=4,ncol=3),nrow = 2 , rel_heights = c(0.1, 1))
+
+ggpubr::annotate_figure(enet_lambda_all_figure,left= ggpubr::text_grob("Cross Validated Predictive Ability\n(Pearson's r)",size=15,rot=90),
+                        bottom = ggpubr::text_grob("Lambda",size=15))
+```
+
+## Out-of-sample, out-of-scanner predictive ability of the elastic net 
+
+```{r fit_enet3}
+
+fit_enet_single_all <- resp_names %>% map(.,~glmnet(x = as.matrix(select(ols_var_all_train_IQR[[.]], starts_with("roi"))) , y = ols_var_all_train_IQR[[.]][[.]], alpha = glmn_tuning_all_IQR[[.]]$mixture, lambda = glmn_tuning_all_IQR[[.]]$penalty)) 
+preds_enet_all <- resp_names%>% map(.,~predict(fit_enet_single_all[[.]] , newx = as.matrix(select(ols_var_all_test_IQR[[.]], starts_with("roi")))))
+
+predvsreal_enet_all <- resp_names %>% map (.,~tibble(predicted = preds_enet_all[[.]], observed = as.numeric(ols_var_all_test_IQR[[.]][[.]]))) 
+
+cor_enet_all <- resp_names %>% map(.,~cor(preds_enet_all[[.]], as.numeric(ols_var_all_test_IQR[[.]][[.]])))   
+rmse_enet_all <-resp_names %>% map(.,~sqrt(mean((preds_enet_all[[.]] - as.numeric(ols_var_all_test_IQR[[.]][[.]])) ^ 2))) 
+
+enet_single_plot <- resp_names %>% map(.,~ggplot(predvsreal_enet_all[[.]], aes(x = scale(predicted) , y = scale(observed) )) +
+  geom_jitter(height = 0.1, width = 0.1, size = 1, col = 'grey60') +
+  geom_smooth(method = 'lm', se = FALSE, col = 'black') +
+  labs(x = NULL,
+       y = NULL,
+       title = paste (resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]],'\nr = ',round(cor_enet_all[[.]], 3))))
+  
+title_enet_pred_plot <- ggdraw() + 
+  draw_label(
+    "Out-of-Sample Elastic Net Predictive Ability",
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+
+
+
+enet_pred_all_figure<- plot_grid(title_enet_pred_plot,plot_grid(plotlist = enet_single_plot),nrow = 2 , rel_heights = c(0.1, 1))
+
+ggpubr::annotate_figure(enet_pred_all_figure,left= ggpubr::text_grob("Observed Cognitive Performance (Z)",size=15,rot=90),
+                        bottom = ggpubr::text_grob("Predicted Cognitive Performance (Z)",size=15))
+```
+
+## Out-of-sample predictive ability of the elastic net on n back
+
+```{r fit_enet4 ,fig.width=8,fig.height=6}
+ggplot(predvsreal_enet_all[[resp_names[1]]], aes(x = scale(predicted) , y = scale(observed) )) +
+  geom_jitter(height = 0.1, width = 0.1, size = 1, col = 'grey60') +
+  geom_smooth(method = 'lm', se = FALSE, col = 'black') +
+  labs(x =paste0("Predicted ",  resp_var_plotting$short_name[[which(resp_var_plotting$response==resp_names[1])]] ," (Z)")  ,
+       y = paste0("Observed\n",  resp_var_plotting$short_name[[which(resp_var_plotting$response==resp_names[1])]] ," (Z)"),
+       title = paste ("Out-of-Sample Elastic Net\nPredictive Ability ",'r = ',round(cor_enet_all[[resp_names[1]]], 2)))+
+       theme(axis.text=element_text(size=28),
+        axis.title=element_text(size=28),
+        plot.title = element_text(size=32))
+
+```
+
+## Stats inference of elastic net via enetXplorer
+
+```{r fit_enet5}
+
+extract_tibble <- function(elastic_mod, alpha_index) {
+   variable <- elastic_mod$feature_coef_wmean[, alpha_index] %>% names()
+    wmean <- elastic_mod$feature_coef_wmean[, alpha_index]
+    wsd <- elastic_mod$feature_coef_wsd[, alpha_index]
+    null_wmean <- elastic_mod$null_feature_coef_wmean[, alpha_index]
+    null_wsd <- elastic_mod$null_feature_coef_wsd[, alpha_index]
+    pvalue <- elastic_mod$feature_coef_model_vs_null_pval[, alpha_index]
+    
+    tib <- tibble(variable, wmean, wsd, null_wmean, null_wsd, pvalue)
+   
+    tib <- tib %>%
+      gather(key = 'placeholder', value = 'value', wmean, wsd, null_wmean, null_wsd) %>%
+      mutate(type = ifelse(str_detect(placeholder, 'null'), 'null', 'target'),
+             placeholder = (str_remove(placeholder, 'null_'))) %>%
+      mutate(type = factor(type, labels = c('Null', 'Target'))) %>%
+      spread(placeholder, value)
+    tib
+}
+
+
+ elastic_mod <- fit_enet_all_IQR[[resp_names[1]]]
+    alpha_index <- paste0("a",glmn_tuning_all_IQR[[resp_names[1]]]$mixture)
+
+    
+  coefs_enet_all <- resp_names %>%  map(.,~extract_tibble(fit_enet_all_IQR[[.]], alpha_index = paste0("a",glmn_tuning_all_IQR[[.]]$mixture)))
+    coefs_enet_all <- coefs_enet_all  %>% map(.,~filter(.,pvalue < 0.05) %>%
+  mutate(.,type = ifelse(type == 'Null', 'Null permuted models', 'Target models'),
+         roi = str_remove(variable, 'roi_'))%>%left_join( .,new_shorter_names,by="roi"))
+roi_num_enet <- coefs_enet_all %>% map(.,~dim(.)[1])
+max_roi_enet <- max(as.numeric(roi_num_enet))
+
+coefs_enet_test <- coefs_enet_all[[resp_names[1]]] %>% group_by(type)
+coefs_enet_test <- coefs_enet_test%>% nest(-type)
+ coefs_enet_test[[2]][[1]] <- coefs_enet_test[[2]][[1]] %>% mutate(direction1 = ifelse(coefs_enet_test[[2]][[1]]$wmean >= median(coefs_enet_test[[2]][[1]]$wmean)|roi_num_enet[[resp_names[1]]] <= floor(max_roi_enet/2),"big","small"))
+coefs_enet_test[[2]][[2]] <- coefs_enet_test[[2]][[2]] %>% mutate(direction1=coefs_enet_test[[2]][[1]]$direction1)
+coefs_enet_test <- coefs_enet_test %>% unnest()
+
+coefs_enet_all <- coefs_enet_all%>%map(.,~group_by(.,type)) 
+coefs_enet_all <- coefs_enet_all%>%map(.,~nest(.,-type)) 
+for(i in 1:length(resp_names)){
+  coefs_enet_all[[resp_names[i]]][["data"]][[2]]<-coefs_enet_all[[resp_names[i]]][["data"]][[2]] %>% mutate(direction = ifelse(coefs_enet_all[[resp_names[i]]][["data"]][[2]]$wmean >= median(coefs_enet_all[[resp_names[i]]][["data"]][[2]]$wmean)|roi_num_enet[[resp_names[i]]] <= floor(max_roi_enet/2),"big","small"))
+  coefs_enet_all[[resp_names[i]]][["data"]][[1]] <- coefs_enet_all[[resp_names[i]]][["data"]][[1]] %>% mutate(direction=coefs_enet_all[[resp_names[i]]][["data"]][[2]]$direction)
+}
+
+coefs_enet_all <- coefs_enet_all %>%map(.,~unnest(.)) 
+
+resp_names %>% map(.,~ggplot(coefs_enet_all[[.]], aes(x = fct_reorder(roiShort, wmean), 
+             y = wmean, 
+             ymax = wmean + 2 * wsd, ymin = wmean - 2 * wsd,
+             col = type)) +
+  geom_pointrange(fatten = 0.5, key_glyph = 'point') +
+  scale_y_continuous(labels = numform::ff_num(zero = 0, digits = 2)) + 
+  scale_color_grey(start = 0.7, end = 0.5) +
+  coord_flip() +
+  guides(colour = guide_legend(override.aes = list(size = 2.5)))+
+  labs(x = 'Explanatory Variables (Brain Regions)', y = 'Averaged Coefficient Across Models (±2 Std. dev)', col = 'Model type',
+       title = paste0(resp_var_plotting$longer_name[[which(resp_var_plotting$response==.)]],"\nElastic Net Coefficients (p < .05)")) +
+  facet_wrap(~ direction, scales = 'free_y') +
+  scale_color_manual(values = c("#56B4E9", "black"),labels = c("Permuted Null", "Target")) +     
+  theme_bw() +  
+#theme(axis.text.y = element_text(angle = 15)) +
+theme(legend.title=element_blank()) +  
+theme(legend.position = "top") + 
+theme(
+  axis.title.x = element_text(size = 15),
+  axis.text.x = element_text(size = 12),
+  axis.title.y = element_text(size = 15),
+  axis.text.y = element_text(size = 12),
+  legend.text = element_text(size = 15),
+  plot.title = element_text(size=15)) +
+ theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank()
+) 
++ theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+)
+
+n_signif_enet_all <- coefs_enet_all %>% map(.,~filter(.,type == 'Target models')%>%count())%>% bind_rows()
+n_sig_enet_all <- data.frame("var_name"=resp_var_plotting$short_name,"ENET_total"=n_signif_enet_all$n)%>% as_tibble()%>%print()
+```
+
+## Cross-validate enet regression across sites
+
+```{r glmnet_tuning_all_site, eval= TRUE}
+enet_site_all <- function(resp_var){
+site_tuning_all <- all_sample %>% future_map(.,~enet_tuning(resp_var, data_split=site_vfold$splits[[which(site_vfold$id==.)]]))
+names(site_tuning_all)<- all_sample %>% map (.,~unique(assessment(site_vfold$splits[[which(site_vfold$id==.)]])$SITE_ID_L)) 
+site_tuning_all<- site_tuning_all %>% bind_rows()
+site_tuning_all <- site_tuning_all %>% mutate(site=all_site, response=resp_var,method="Elastic Net")
+return(site_tuning_all)
+}
+
+```
+
+```{r glmnet_tuning_all_site_computing, eval= FALSE}
+enet_site_tuning_all_IQR <- resp_names %>% future_map(.,~enet_site_all(resp_var=.))
+```
+
+```{r, eval=FALSE,echo=FALSE}
+saveRDS(enet_site_tuning_all_IQR,file ="/mnt/data/Yue script/enet_site_tuning_all_IQR.RData" )
+```
+
+# Out-of-site predictive ablitiy across methods
+
+```{r,echo=FALSE}
+enet_site_tune_all_IQR <- readRDS(file ="/mnt/data/Yue script/enet_site_tuning_all_IQR.RData")
+```
+
+```{r fit_enet4}
+enet_site_tune_all_plot <- enet_site_tune_all_IQR %>% bind_rows()
+enet_site_tune_all_plot <- left_join(enet_site_tune_all_plot,resp_var_plotting,by="response")
+
+joint_enet_tune_all <- enet_site_tune_all_plot %>% select(performance, site, method, longer_name, short_name, response)
+all_method_performance <- bind_rows(joint_enet_tune_all,ols_cross_site,simple_leave_one_all_FDR_median_IQR,simple_leave_one_all_bonf_median_IQR)%>%
+  mutate(method= as.factor(method))%>%
+  mutate(method = factor(method,levels =c ("FDR","Bonferroni","OLS","Elastic Net")))
+
+
+all_method_performance%>%
+ggplot(aes(x = reorder(short_name,performance), y = performance, fill=method,color=method)) +
+  geom_jitter(width = 0.1, height = 0, size = 0.5) +
+  geom_boxplot(alpha = 0.5,  outlier.colour = NA, position = "identity") +
+  labs(x = NULL, y=NULL,title="Out-of-site Predictive Ability (Pearson's r)") +
+  coord_flip()+theme(axis.text=element_text(size=15),
+        axis.title=element_text(size=15,face="bold"),
+        legend.position = "bottom",
+        legend.title=element_blank(),
+        legend.text = element_text( size=15, face="bold"),
+        plot.title = element_text(size=17))
+
+```
+
+```{r plotting_all_methods_against_simple}
+
+simple_site_FDR  <- simple_leave_one_all_FDR_IQR%>%map(.,~unnest(.)%>% mutate(method="FDR")) 
+simple_site_bonf <- simple_leave_one_all_bonf_IQR %>% map(.,~unnest(.)%>%mutate(method="Bonferroni"))
+ols_site <- ols_cross_site_list %>% map(.,~dplyr::select(., method, site,performance)%>%mutate(site = str_remove_all(site,"site")))
+enet_site <- enet_site_tune_all_IQR %>% map(.,~select(.,method,site,performance)%>%mutate(site = str_remove_all(site,"site")))
+cross_site_multi <- resp_names %>% map(.,~bind_rows(ols_site[[.]],enet_site[[.]]))
+
+
+resp_names %>%map(.,~ggplot(cross_site_multi[[.]], aes(site, performance, col = method)) +
+  geom_point(key_glyph = "point", size = 3) +
+  geom_jitter(data = simple_site_FDR[[.]], height = 0, width = 0.2, size = 0.5,
+              key_glyph = "point") +
+  geom_boxplot(data = simple_site_FDR[[.]], alpha = 0.75, outlier.colour = NA,
+               key_glyph = "point")+
+  geom_jitter(data = simple_site_bonf[[.]], height = 0, width = 0.2, size = 0.5,
+              key_glyph = "point") +
+  geom_boxplot(data = simple_site_bonf[[.]], alpha = 0.75, outlier.colour = NA,
+               key_glyph = "point") +
+ # scale_x_discrete(guide = guide_axis(n.dodge = )) +
+  scale_color_manual(breaks=c("Elastic Net","OLS", "Bonferroni","FDR"),
+    values = c( "#C77CFF","#00BFC4" ,"#7CAE00","#F8766D" )) +
+  guides(colour = guide_legend(override.aes = list(size = 2.5)))+
+  labs(x = 'Site', y=NULL, col = 'Model',
+       title  = paste0("Out-of-site Predictive Ability (Pearson's r)\n",resp_var_plotting$longer_name[[which(resp_var_plotting$response==.)]]))+
+  theme(axis.text.x=element_text(size=16, angle = 45),
+        axis.text.y=element_text(size=16),
+        axis.title.y=element_text(size=18),
+        axis.title.x=element_text(size=18),
+        plot.title=element_text(size=20),
+        legend.position = "right",
+        legend.title=element_blank(),
+        legend.text = element_text( size=18)))   
+
+```
+
+# VIF
+we used the training data and OLS to compute the VIF
+
+```{r fit_ols4}
+vifs_ols_all <- resp_names %>% future_map(.,~ols_vif_tol(fit_ols_all[[.]]))
+vifs_ols_all <- vifs_ols_all %>% map(.,~mutate(., term=Variables))
+vifs_ols_all[[resp_names[1]]] %>% ggplot(aes(x = VIF)) +
+  geom_histogram(fill = 'grey80', binwidth = .5) +
+  scale_x_continuous(breaks = seq(0, 13, by = 3)) +
+  labs(x = "Explanatory Variables (Regions)",
+       y = 'Count', title="Variance Inflation Factor of\nOLS Explanatory Variables")+ 
+   theme_light() +
+  theme(text = element_text(size = 30))
+
+summary(vifs_ols_all[[1]]$VIF)  
+
+```
+
+## prepare data to plot vif, significant, se/sd and coef for OLS and elastic net
+
+```{r}
+
+realModelTidy <- tidy(fit_ols_all[[resp_names[1]]]) 
+
+realModelVif <- tibble::enframe(car::vif(fit_ols_all[[resp_names[1]]])) %>% 
+  rename(term = name, vif = value) 
+                
+realModelTidyVif <- realModelTidy %>% left_join(realModelVif, by ="term")
+
+coefs_enet <- extract_tibble(elastic_mod = fit_enet_all_IQR[[resp_names[1]]],alpha_index = paste0("a",glmn_tuning_all_IQR[[1]]$mixture))%>% 
+  mutate(type = ifelse(type == 'Null', 'Null permuted models', 'Target models'))
+
+coefs_enetTrimmed <- coefs_enet %>% filter(type != "Null permuted models") %>% 
+  rename(term = variable, eNetPval = pvalue) 
+
+realModelTidyVifEnet <- realModelTidyVif %>% left_join(coefs_enetTrimmed, by ="term")
+
+realModelTidyVifEnetNonTrimmed <- coefs_enet %>%   rename(term = variable, eNetPval = pvalue) %>%
+   left_join(realModelTidyVif, by ="term")
+
+coefs_enetNull <- coefs_enet %>% filter(type == "Null permuted models") %>% 
+  rename(nullWmean = wmean, nullWsd = wsd, term = variable) %>% select(term, nullWmean, nullWsd)
+
+coefs_enetTarget <- coefs_enet %>% filter(type != "Null permuted models") %>% 
+  rename(targetWmean = wmean, targetWsd = wsd, term = variable,eNetPval = pvalue) %>% select(term, eNetPval, targetWmean, targetWsd)
+
+realModelTidyVifEnetNull <- realModelTidyVif %>% left_join(coefs_enetTarget,by ="term") %>% left_join(coefs_enetNull, by ="term") 
+
+```
+
+## OLS SE as a funct of VIF
+
+```{r}
+ggplot(realModelTidyVifEnetNull , aes(x = vif, y = std.error, color= p.value<=.05, )) +
+  geom_point(size = 5, alpha = 0.4) + 
+  scale_colour_discrete(name="p value",
+                         breaks=c("FALSE", "TRUE"),
+                         labels=c("> .05", "< .05")) +
+#  geom_linerange() +
+  theme_light() +
+  theme(text = element_text(size = 30)) +
+  theme(legend.position="top") + 
+  xlab("Variance Inflation Factor") + ylab("OLS\nStandard Error") +
+  ylim(0, .05)
+
+```
+
+## OLS Coef ±2SE as a funct of VIF
+
+```{r}
+
+ggplot(realModelTidyVifEnetNull , aes(x = vif, y = estimate, color= p.value<=.05, ymin = estimate - (2 * std.error), ymax = estimate + (2 * std.error))) +
+  geom_point(size = 5, alpha = 0.4) + 
+  scale_colour_discrete(name="p value",
+                         breaks=c("FALSE", "TRUE"),
+                         labels=c("> .05", "< .05")) +
+  geom_linerange() +
+  theme_light() +
+  theme(text = element_text(size = 30)) +
+  guides(color = FALSE) +
+#  theme(legend.position="top") + 
+  xlab("Variance Inflation Factor") + ylab("OLS\nCoefficients ±2SE") +
+  geom_hline(yintercept = 0) 
+
+```
+
+## Enet null SD as a funct of VIF
+
+```{r}
+realModelTidyVifEnetNull %>%
+ggplot(aes(x = vif, y = nullWsd, color= p.value<=.05, )) +
+  geom_point(size = 5, alpha = 0.4) + 
+  scale_colour_discrete(name="p value",
+                         breaks=c("FALSE", "TRUE"),
+                         labels=c("> .05", "< .05")) +
+#  geom_linerange() +
+  theme_light() +
+  theme(text = element_text(size = 30)) +
+  theme(legend.position="top") + 
+  xlab("Variance Inflation Factor") + ylab("Elastic Net\nSD of Permuted Null") +
+  ylim(0, .021)
+```
+
+## Enet null Coef ±2SD as a funct of VIF
+
+```{r}
+
+ggplot(realModelTidyVifEnetNull, aes(x = vif, y = nullWmean, color= eNetPval<=.05, 
+                                     ymin = nullWmean - (2 * nullWsd), ymax = nullWmean + (2 * nullWsd))) +
+  geom_point(size = 5, alpha = 0.4) + 
+  scale_colour_discrete(name="p value",
+                         breaks=c("FALSE", "TRUE"),
+                         labels=c("> .05", "< .05")) +
+  geom_linerange() +
+  theme_light() +
+  theme(text = element_text(size = 30)) +
+  guides(color = FALSE) +
+  #theme(legend.position="top") + 
+  xlab("Variance Inflation Factor") + ylab("Elastic Net\nCoefficients of\n Permuted Null ± 2SD") 
+
+
+ggplot(realModelTidyVifEnetNonTrimmed, aes(x = vif, y = wmean, 
+                                           color= eNetPval<=.05, 
+                                           ymin = wmean - (2 * wsd), ymax = wmean + (2 * wsd),
+                                           shape = type)) +
+  geom_point(size = 5, alpha = 0.4) + 
+  scale_colour_discrete(name="p value",
+                         breaks=c("FALSE", "TRUE"),
+                         labels=c("> .05", "< .05")) +
+  scale_shape_discrete(name="",
+                         breaks=c("Null permuted models", "Target models"),
+                         labels=c("Null", "Target")) +
+  geom_linerange() +
+  theme_light() +
+  theme(text = element_text(size = 30)) +
+  guides(color = FALSE) +
+  theme(legend.justification=c(1,0), legend.position=c(1,0)) +
+  #theme(legend.position="top") + 
+  xlab("Variance Inflation Factor") + ylab("Elastic Net\nCoefficients ± 2SD") 
+
+```
+
+# Compare significant explanatory vars across models
+
+```{r signif, fig.height=16, fig.width=8}
+signif_rois_fdr_all <- simple_all_IQR %>% map(.,~mutate(.,signif = ifelse(FDR < 0.05, 1, 0),model = 'FDR',roi = str_remove(roi, 'roi_')) %>%
+  select(.,model, roi, signif)%>%
+    left_join(.,new_shorter_names, by= "roi"))
+  
+signif_rois_bonf_all <- simple_all_IQR %>% map(.,~mutate(.,signif = ifelse(bonferroni < 0.05, 1, 0),model = 'Bonferroni',roi = str_remove(roi, 'roi_')) %>%select(.,model, roi, signif)%>%
+    left_join(.,new_shorter_names, by= "roi"))
+
+signif_rois_ols_all <-fit_ols_all %>% map(.,~broom::tidy(.) %>%filter(.,term != '(Intercept)') %>%
+  mutate(.,signif = ifelse(p.value < 0.05, 1, 0),model = 'OLS',roi = str_remove(term, 'roi_')) %>%
+  select(.,model, roi, signif)%>%
+    left_join(.,new_shorter_names, by= "roi")) 
+
+signif_rois_enet_all <- resp_names %>%  map(.,~extract_tibble(fit_enet_all_IQR[[.]], alpha_index = paste0("a",glmn_tuning_all_IQR[[.]]$mixture))%>%
+  filter(.,type != 'Null') %>%
+  mutate(.,roi = str_remove(variable, '^roi_'),signif = ifelse(pvalue < 0.05, 1, 0),model = 'Elastic net') %>%
+  select(.,model, roi, signif)%>%
+    left_join(.,new_shorter_names, by= "roi")) 
+
+signif_rois_all <- resp_names %>% map(.,~bind_rows(signif_rois_fdr_all[[.]], signif_rois_bonf_all[[.]], signif_rois_ols_all[[.]], signif_rois_enet_all[[.]]) %>%mutate(.,model = factor(model, levels = c('FDR', 'Bonferroni','OLS', 'Elastic net')))) 
+
+signif_rois_long_all <- signif_rois_all %>% map(.,~pivot_wider(.,names_from = model, values_from = signif) %>%
+  filter(.,`FDR` == 1 | `Bonferroni` == 1 | `OLS` == 1 | `Elastic net` == 1) %>%
+  mutate(.,n_mods = 1 * `OLS` + 2 * `Elastic net` + 4 * `Bonferroni` + 6 * `FDR`) %>% 
+  pivot_longer(.,names_to = 'model', values_to = 'signif', cols = `FDR`:`Elastic net`) %>%
+  mutate(.,signif = ifelse(signif == 0, 'Not significant', 'Significant'))%>%
+  mutate(.,model = factor(model, levels = c('Elastic net','OLS' ,'Bonferroni', 'FDR'))) %>%
+  mutate(.,facetRow4 = ifelse(row_number() <= (nrow(.)/4)+2, 'Left', 
+                             ifelse(row_number() <= ((nrow(.)/4)*2), 'LeftMid',
+                                    ifelse(row_number() <= ((nrow(.)/4)*3)+2, 'RightMid', 'Right')))) %>%
+  mutate(.,facetRow3 = ifelse(row_number() <= nrow(.)/3, 'Left', 
+                             ifelse(row_number() <= (nrow(.)/3)*2, 'Mid','Right'))) %>% 
+   mutate(.,facetRow2 = ifelse(row_number() <= nrow(.)/2, 'Left', 'Right'))  
+  )
+```
+
+
+```{r,fig.height=6, fig.width=10}
+ resp_names%>% map(~ggplot(signif_rois_long_all[[.]],aes(x = fct_rev(model), y = fct_reorder(roiShort, n_mods), fill = signif)) +
+  geom_tile(col = 'grey60') +
+ # scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+  scale_fill_manual(values = c('grey80', "#56B4E9")) +
+  labs(x = '', y = 'Brain Regions', fill = '',
+       title = resp_var_plotting$longer_name[[which(resp_var_plotting$response==.)]]) +
+facet_wrap(~ facetRow4, scales = 'free_y', ncol= 4) +
+# theme(aspect.ratio = 6) +
+  theme(plot.title = element_text(size = 20)) + 
+  theme(legend.position="top") +
+  theme(legend.text = element_text(size = 15)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  theme(axis.title.y = element_text(size =15)) + 
+  theme(axis.text.x = element_text(size = 10)) +
+  theme(axis.text.y = element_text(size = 10)) + 
+    theme(
+    strip.background = element_blank(),
+    strip.text.x = element_blank()))  
+```
+
+# Ploting coefs on the brain
+
+```{r libraries}
+library(ggseg)
+library(ggsegExtra)
+#library(ggseg3d)
+library(ggsegDesterieux)
+library(RColorBrewer)
+library(ggpubr)
+library(png)
+library("cowplot")
+```
+
+## Create a dataframe using atlas' labels
+
+```{r input_all_analysis_outputs, echo=FALSE}
+data_all_listwise <- readRDS(file = "/mnt/data/Yue script/data_all_listwise.RData")
+## simple regressions
+simple_all <- readRDS(file ="/mnt/data/Yue script/simple_reg_all_IQR.RData" )
+## OLS
+fit_ols_all <- readRDS(file ="/mnt/data/Yue script/fit_ols_all_IQR.RData")
+## Elastic net
+fit_ridge_all  <- readRDS('/mnt/data/Yue script/fit_ridge_all_IQR.RData')
+## Elastic net parameter tuning
+glmn_tuning_all <- readRDS(file ="/mnt/data/Yue script/glmn_tune_all_IQR.RData")
+#saveRDS(tidy_fit_enet_all, file='/mnt/data/Yue script/tidy_fit_enet_all.RData')
+tidy_fit_enet_all<- readRDS(file='/mnt/data/Yue script/tidy_fit_enet_all_IQR.RData')
+
+```
+
+## variable names
+
+```{r response_names}
+Resp_Var <- c('TFMRI_NB_ALL_BEH_C2B_RATE',
+              "NIHTBX_PICVOCAB_UNCORRECTED", 
+              "NIHTBX_FLANKER_UNCORRECTED",
+              "NIHTBX_LIST_UNCORRECTED",
+              "NIHTBX_CARDSORT_UNCORRECTED",
+              "NIHTBX_PATTERN_UNCORRECTED",
+              "NIHTBX_PICTURE_UNCORRECTED",
+              "NIHTBX_READING_UNCORRECTED",
+              "LMT_SCR_PERC_CORRECT",
+              "PEA_RAVLT_LD_TRIAL_VII_TC",
+              "PEA_WISCV_TRS")
+resp_var_plotting_long <- c("2-back task: percent accuracy",
+  "Picture vocabulary test",
+  "Flanker test",
+  "List sorting working memory",
+  "Dimentional change card sort test",
+  "Pattern comparison processing speed test",
+  "Picture sequence memory test",
+  "Oral reading recognition test",
+  "Little man task correct percentage",
+  "RAVLT long delay trial VII total correct",
+  "WISC_V matrix reasoning total raw score"
+)
+resp_var_plotting_short <- c("2-back Work Mem","Pic Vocab","Flanker","List Work Mem","Cog Flex","Pattern Speed","Seq Memory","Reading Recog","Little Man","Audi Verbal","Matrix Reason")
+resp_var_plotting <- tibble("response" =Resp_Var, "longer_name"=resp_var_plotting_long,"short_name"=resp_var_plotting_short)
+
+resp_names <-data_all_listwise %>% select(all_of(Resp_Var))%>%
+  names()%>%
+  set_names()
+```
+
+```{r ggseg, fig.show='hide'}
+##data manipulation for plotting
+coefs_simple_all <- simple_all %>% map(.,~mutate(.,label = str_replace_all(roi, '\\.', '-')) %>% 
+  mutate(.,label = str_replace_all(label, 'roi_', '')) %>% 
+  mutate(.,label = str_replace_all(label, 'Brain-Stem', 'brain-stem')) %>% 
+  mutate(.,label = str_replace_all(label, 'Right-Cerebellum-Cortex
+', 'right-cerebellum-cortex')) %>% 
+  mutate(.,estimateFDR = ifelse(FDR <= .05, estimate, NA)) %>% 
+  mutate(.,estimateBon = ifelse(bonferroni <= .05, estimate, NA)))
+
+coefs_simple_ggsegDes_all <- vector("list", length = length(resp_names))
+names(coefs_simple_ggsegDes_all)<- resp_names
+
+for(i in 1:length(resp_names)){
+  #desterieux is our subcortical atlas
+coefs_simple_ggsegDes_all[[resp_names[i]]] <- desterieux %>% 
+  select(label) %>% 
+  na.omit() %>% 
+  left_join(select(coefs_simple_all[[resp_names[i]]], label, estimate, estimateFDR, estimateBon,performance), by = "label")
+}
+
+#original aseg has both axial and sagital views. Need to filter out sagital view
+aseg <- aseg %>% filter(side=="axial")
+
+coefs_simple_ggsegAseg_all <- vector("list", length = length(resp_names))
+names(coefs_simple_ggsegAseg_all)<- resp_names
+
+for(i in 1:length(resp_names)){
+#aseg is our subcortical atlas
+coefs_simple_ggsegAseg_all[[resp_names[i]]] <- aseg %>% 
+  select(label) %>% 
+  na.omit() %>% 
+  left_join(select(coefs_simple_all[[resp_names[i]]], label, estimate, estimateFDR, estimateBon,performance), by = "label")
+}
+
+estimationLimit_all <-resp_names%>% map(.,~c(range(c(coefs_simple_ggsegDes_all[[.]]$estimate,coefs_simple_ggsegAseg_all[[.]]$estimate), na.rm = TRUE))) 
+performanceLimit_all <-resp_names%>% map(.,~c(range(c(coefs_simple_ggsegDes_all[[.]]$performance,coefs_simple_ggsegAseg_all[[.]]$performance), na.rm = TRUE)))  
+```
+
+## uncorrected estimates on cortical
+
+```{r, fig.show='hide'}
+
+estimateUncorrectedCort_all <-resp_names %>% map(.,~ggseg(.data = coefs_simple_ggsegDes_all[[.]] ,
+              atlas = 'desterieux', 
+              mapping = aes(fill = estimate),
+ #             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = estimationLimit_all[[.]], midpoint = 0, low = "blue", mid = "white",
+                            high = "red", space = "Lab", na.value="transparent" ) +
+              theme(legend.position = "none")+
+              labs(title =resp_var_plotting$longer_name[[which(resp_var_plotting$response==.)]])) 
+
+ggpubr::ggarrange(plotlist=estimateUncorrectedCort_all,nrow=6)
+
+```
+
+## uncorrected estimates on subcortical
+
+```{r, fig.show='hide'}
+
+estimateUncorrectedSub_all <- resp_names %>% map(.,~ggseg(.data = coefs_simple_ggsegAseg_all[[.]] ,
+              atlas = 'aseg', 
+              mapping = aes(fill = estimate),
+              view = "axial",
+ #             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = estimationLimit_all[[.]], midpoint = 0, low = "blue", mid = "white",
+                            high = "red", space = "Lab", na.value="transparent" ) +
+              theme(legend.position = "none")
+ #+ labs(title =resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]])
+ ) 
+ggpubr::ggarrange(plotlist=estimateUncorrectedSub_all,nrow=3,ncol=4)
+
+
+```
+
+## FDR-ed estimates on cortical
+
+```{r , fig.show='hide'}
+estimateFDRCort_all <- resp_names %>% map(.,~ggseg(.data = coefs_simple_ggsegDes_all[[.]] ,
+              atlas = 'desterieux', 
+              mapping = aes(fill = estimateFDR),
+#             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = estimationLimit_all[[.]], midpoint = 0, low = "blue", mid = "white",
+                            high = "red", space = "Lab", na.value="transparent" ) +
+              theme(legend.position = "none") +
+              labs(title =paste0("Mass-Univariate FDR-Corrected Coefficients "))) 
+
+ggarrange(plotlist=estimateFDRCort_all,nrow=6)
+
+```
+
+## FDR-ed estimates on subcortical
+
+```{r, fig.show='hide'}
+
+estimateFDRSub_all  <- resp_names %>% map(.,~ggseg(.data = coefs_simple_ggsegAseg_all[[.]] ,
+              atlas = 'aseg', 
+              mapping = aes(fill = estimateFDR),
+              view = "axial",
+ #             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = estimationLimit_all[[.]], midpoint = 0, low = "blue", mid = "white",
+                            high = "red", space = "Lab", na.value="transparent" ) + 
+              guides(fill = guide_colourbar(barwidth = 0.5, barheight = 3, title = NULL))
+# +labs(title =resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]])
+ ) 
+ggpubr::ggarrange(plotlist=estimateFDRSub_all,nrow=3,ncol=4,common.legend = TRUE,legend = "right")
+```
+
+## Bonferroni-ed estimates on cortical
+
+```{r , fig.show='hide'}
+estimateBonCort_all <- resp_names %>% map(.,~ggseg(.data = coefs_simple_ggsegDes_all[[.]] ,
+              atlas = 'desterieux', 
+              mapping = aes(fill = estimateBon),
+ #             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = estimationLimit_all[[.]], midpoint = 0, low = "blue", mid = "white",
+                            high = "red", space = "Lab", na.value="transparent" ) +
+              theme(legend.position = "none") + 
+              ggtitle(paste0("Mass-Univariate Bonferroni-Corrected Coefficients "))) 
+ggarrange(plotlist=estimateBonCort_all,nrow=6)
+```
+
+## Bonferroni-ed estimates on subcortical
+
+```{r , fig.show='hide'}
+
+estimateBonSub_all <- resp_names %>% map(.,~ggseg(.data = coefs_simple_ggsegAseg_all[[.]] ,
+              atlas = 'aseg', 
+              mapping = aes(fill = estimateBon),
+              view = "axial",
+ #             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = estimationLimit_all[[.]], midpoint = 0, low = "blue", mid = "white",
+                            high = "red", space = "Lab", na.value="transparent" ) + 
+              guides(fill = guide_colourbar(barwidth = 0.5, barheight = 3, title = NULL))
+ #+labs(title =resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]])
+ ) 
+ggpubr::ggarrange(plotlist=estimateBonSub_all,nrow=3,ncol=4,common.legend = TRUE,legend = "right")
+```
+
+## predictive ability of the mass univariate on cortical
+
+```{r ,  fig.show='hide'}
+predictionCort_all <-resp_names %>% map(.,~ggseg(.data = coefs_simple_ggsegDes_all[[.]] ,
+              atlas = 'desterieux', 
+              mapping = aes(fill = performance),
+ #             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = performanceLimit_all[[.]], 
+                                   midpoint = 0, low = "blue", mid = "white",
+                                   high = "red", space = "Lab", na.value="transparent" ) +
+              theme(legend.position = "none") + 
+              ggtitle(paste0("Mass-Univariate Out-Of-Sample Prediction (Pearson's r) "))) 
+ggarrange(plotlist=predictionCort_all,nrow=6)
+```
+
+## prediction performance on subcortical
+
+```{r, fig.show='hide'}
+
+predictionSub_all <-resp_names%>%   map (.,~ggseg(.data = coefs_simple_ggsegAseg_all[[.]] ,
+              atlas = 'aseg', 
+              mapping = aes(fill = performance),
+              view = "axial",
+ #             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = performanceLimit_all[[.]], midpoint = 0, low = "blue", mid = "white",
+                            high = "red", space = "Lab", na.value="transparent") + 
+              guides(fill = guide_colourbar(barwidth = 0.5, barheight = 3, title = NULL))
+#              theme(legend.position = "none")) 
+)
+ggpubr::ggarrange(plotlist=predictionSub_all,nrow=3,ncol=4,common.legend = TRUE,legend = "right")
+```
+
+## OLS
+
+```{r OLS_output_manipulation , fig.show='hide'}
+tidy_fit_ols_all <-fit_ols_all %>%  map(., ~broom::tidy(.)%>%
+                                    filter(.,term != '(Intercept)')%>%
+                                    mutate(.,label = str_replace_all(term, '\\.', '-')) %>% 
+                                    mutate(.,label = str_replace_all(label, 'roi_', '')) %>% 
+                                    mutate(.,label = str_replace_all(label, 'Brain-Stem', 'brain-stem')) %>% 
+                                    mutate(.,label = str_replace_all(label, 'Right-Cerebellum-Cortex', 'right-cerebellum-cortex'))%>% 
+                                    mutate(.,estimate_sig = ifelse(p.value <= .05, estimate, NA)) 
+ )
+
+coefs_ols_ggsegDes_all <- vector("list", length = length(resp_names))
+names(coefs_ols_ggsegDes_all)<- resp_names
+
+for(i in 1:length(resp_names)){
+  #desterieux is our subcortical atlas
+coefs_ols_ggsegDes_all[[resp_names[i]]] <- desterieux %>% 
+  select(label) %>% 
+  na.omit() %>% 
+  left_join(select(tidy_fit_ols_all[[resp_names[i]]], label, estimate, estimate_sig), by = "label")
+}
+
+#original aseg has both axial and sagital views. Need to filter out sagital view
+aseg <- aseg %>% filter(side=="axial")
+
+coefs_ols_ggsegAseg_all <- vector("list", length = length(resp_names))
+names(coefs_ols_ggsegAseg_all)<- resp_names
+
+for(i in 1:length(resp_names)){
+#aseg is our subcortical atlas
+coefs_ols_ggsegAseg_all[[resp_names[i]]] <- aseg %>% 
+  select(label) %>% 
+  na.omit() %>% 
+  left_join(select(tidy_fit_ols_all[[resp_names[i]]], label, estimate, estimate_sig), by = "label")
+}
+
+estimationLimit_ols_all <-resp_names%>% map(.,~c(range(c(coefs_ols_ggsegDes_all[[.]]$estimate,coefs_ols_ggsegAseg_all[[.]]$estimate), na.rm = TRUE))) 
+
+```
+
+```{r , fig.show='hide'}
+
+estimateCort_ols_all <-resp_names %>% map(.,~ggseg(.data = coefs_ols_ggsegDes_all[[.]] ,
+              atlas = 'desterieux', 
+              mapping = aes(fill = estimate_sig),
+ #             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = estimationLimit_ols_all[[.]], midpoint = 0, low = "blue", mid = "white",
+                            high = "red", space = "Lab", na.value="transparent" ) +
+              theme(legend.position = "none")+
+              labs(title =paste0("OLS Coefficients ")) )
+
+ggpubr::ggarrange(plotlist=estimateCort_ols_all,nrow=6)
+```
+
+```{r , fig.show='hide'}
+
+estimateSub_ols_all <- resp_names %>% map(.,~ggseg(.data = coefs_ols_ggsegAseg_all[[.]] ,
+              atlas = 'aseg', 
+              mapping = aes(fill = estimate_sig),
+              view = "axial",
+ #             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = estimationLimit_ols_all[[.]], midpoint = 0, low = "blue", mid = "white",
+                            high = "red", space = "Lab", na.value="transparent" ) + 
+              guides(fill = guide_colourbar(barwidth = 0.5, barheight = 3, title = NULL))
+ #+labs(title =resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]])
+ ) 
+ggpubr::ggarrange(plotlist=estimateSub_ols_all,nrow=3,ncol=4,common.legend = TRUE,legend = "right")
+```
+
+## Elastic net
+
+```{r, fig.show='hide'}
+tidy_fit_enet_all <- vector("list", length = length(resp_names))
+names(tidy_fit_enet_all)<- resp_names
+
+for(i in 1: length(resp_names)){
+  elastic_mod=fit_ridge_all[[resp_names[i]]]
+  alpha_index = paste0("a",glmn_tuning_all[[resp_names[i]]]$mixture)
+  variable <- elastic_mod$feature_coef_wmean[, alpha_index] %>% names()
+    wmean <- as.numeric(elastic_mod$feature_coef_wmean[, alpha_index])  
+    pvalue <- as.numeric(elastic_mod$feature_coef_model_vs_null_pval[, alpha_index]) 
+    tib <- tibble::tibble(variable, wmean, pvalue)
+    tidy_fit_enet_all[[resp_names[i]]]<- tib}
+```
+
+
+```{r, fig.show='hide'}
+tidy_fit_enet_all <-tidy_fit_enet_all %>%  map(., ~mutate(.,label = str_replace_all(variable, '\\.', '-')) %>% 
+                                    mutate(.,label = str_replace_all(label, 'roi_', '')) %>% 
+                                    mutate(.,label = str_replace_all(label, 'Brain-Stem', 'brain-stem')) %>% 
+                                    mutate(.,label = str_replace_all(label, 'Right-Cerebellum-Cortex', 'right-cerebellum-cortex'))%>% 
+                                    mutate(.,estimate_sig = ifelse(pvalue <= .05, wmean, NA)))
+```
+
+
+```{r, fig.show='hide'}
+coefs_enet_ggsegDes_all <- vector("list", length = length(resp_names))
+names(coefs_enet_ggsegDes_all)<- resp_names
+
+for(i in 1:length(resp_names)){
+  #desterieux is our subcortical atlas
+coefs_enet_ggsegDes_all[[resp_names[i]]] <- desterieux %>% 
+  select(label) %>% 
+  na.omit() %>% 
+  left_join(select(tidy_fit_enet_all[[resp_names[i]]], label, wmean, estimate_sig), by = "label")
+}
+
+#original aseg has both axial and sagital views. Need to filter out sagital view
+aseg <- aseg %>% filter(side=="axial")
+
+coefs_enet_ggsegAseg_all <- vector("list", length = length(resp_names))
+names(coefs_enet_ggsegAseg_all)<- resp_names
+
+for(i in 1:length(resp_names)){
+#aseg is our subcortical atlas
+coefs_enet_ggsegAseg_all[[resp_names[i]]] <- aseg %>% 
+  select(label) %>% 
+  na.omit() %>% 
+  left_join(select(tidy_fit_enet_all[[resp_names[i]]], label, wmean, estimate_sig), by = "label")
+}
+
+estimationLimit_enet_all <-resp_names%>% map(.,~c(range(c(coefs_enet_ggsegDes_all[[.]]$wmean,coefs_enet_ggsegAseg_all[[.]]$wmean), na.rm = TRUE))) 
+```
+
+```{r, fig.show='hide'}
+
+estimateCort_enet_all <-resp_names %>% map(.,~ggseg(.data = coefs_enet_ggsegDes_all[[.]] ,
+              atlas = 'desterieux', 
+              mapping = aes(fill = estimate_sig),
+ #             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = estimationLimit_enet_all[[.]], midpoint = 0, low = "blue", mid = "white",
+                            high = "red", space = "Lab", na.value="transparent" ) +
+              theme(legend.position = "none")+
+              labs(title =paste0("Elastic Net Coefficients ")) )
+
+ggpubr::ggarrange(plotlist=estimateCort_enet_all,nrow=6)
+```
+
+
+```{r, fig.show='hide'}
+
+estimateSub_enet_all <- resp_names %>% map(.,~ggseg(.data = coefs_enet_ggsegAseg_all[[.]] ,
+              atlas = 'aseg', 
+              mapping = aes(fill = estimate_sig),
+              view = "axial",
+ #             position = "stacked",
+              colour="black"
+              ) + 
+              theme_void() +
+              scale_fill_gradient2(limits = estimationLimit_enet_all[[.]], midpoint = 0, low = "blue", mid = "white",
+                            high = "red", space = "Lab", na.value="transparent" ) + 
+              guides(fill = guide_colourbar(barwidth = 0.5, barheight = 3, title = NULL))
+ #+labs(title =resp_var_plotting$short_name[[which(resp_var_plotting$response==.)]])
+ ) 
+ggpubr::ggarrange(plotlist=estimateSub_enet_all,nrow=3,ncol=4,common.legend = TRUE,legend = "right")
+```
+
+## Combine all of the methods  
+
+```{r, echo=FALSE, fig.align = "center", fig.height = 7, fig.width = 7}
+library("grid")
+library("gridExtra")
+
+
+resp_names %>% map(.,~gridExtra::grid.arrange(estimateFDRCort_all[[.]], estimateFDRSub_all[[.]], 
+                        estimateBonCort_all[[.]], estimateBonSub_all[[.]], 
+                        predictionCort_all[[.]], predictionSub_all[[.]],
+                        estimateCort_ols_all[[.]],estimateSub_ols_all[[.]],
+                        estimateCort_enet_all[[.]],estimateSub_enet_all[[.]],
+                        nrow = 5, ncol = 2,
+                        widths  = c(4, 1.5), 
+                        heights=unit(c(1.1,1.1,1.1,1.1,1.1), c("in","in", "in", "in","in")),
+                        top = textGrob(resp_var_plotting$longer_name[[which(resp_var_plotting$response==.)]],
+                                       gp=gpar(fontsize=20,font=3),
+                                       hjust=0,x=0)))
+```
+
+# R session and library
+```{r}
+
+pander::pander(sessionInfo())
+
+```
